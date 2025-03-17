@@ -1,3 +1,10 @@
 {
-  "cSpell.words": ["Bigram", "itos", "multinomial", "stoi"]
+  "cSpell.words": [
+    "Bigram",
+    "itos",
+    "multinomial",
+    "stoi",
+    "xbow",
+    "xprev"
+  ]
 }
