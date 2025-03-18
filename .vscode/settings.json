@@ -1,9 +1,13 @@
 {
   "cSpell.words": [
+    "allclose",
     "Bigram",
     "itos",
+    "keepdim",
     "multinomial",
+    "rtol",
     "stoi",
+    "tril",
     "xbow",
     "xprev"
   ]
