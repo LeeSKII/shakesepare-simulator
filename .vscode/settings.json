@@ -2,6 +2,7 @@
   "cSpell.words": [
     "allclose",
     "Bigram",
+    "ffwd",
     "itos",
     "keepdim",
     "multinomial",
