@@ -132,16 +132,42 @@ class Block(nn.Module):
         
         self.sa = MultiHeadAttention(n_heads=n_heads,head_size=head_size)
         self.ffwd = FeedForward(n_embed)
+         # 8. layer norm 进一步帮助优化训练深层网络，相当于将每一个token的embed的值的数值分布都进行了标准正态分布的normalization
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
     
     def forward(self,x):
         # return self.block(x)
         
         # 7. x + 是使用了残差连接，sa和ffwd都是属于残差连接旁边的块，刚开始这些块对训练的贡献很小，相当于x=x+0，但是随着训练的进行，
         #    这些块的输出会逐渐变得更加重要，最终可以帮助模型更好地拟合数据，这就是残差连接的原理。
-        x = x + self.sa(x)
-        x = x + self.ffwd(x)
+        # 8. 原始论文中，layer norm是位于multi head attention和feed-forward层之后，但是现在的做法更多的是reshuffle layer norm，在attention和ffd计算之前使用。
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
         return x
     
+
+
+class LayerNorm1d:
+    '''层归一化，对比batch norm，层归一化只对每个样本,如按时间步T这个维度的方向进行归一化，而batch norm对整个batch，按B的方向进行归一化。
+       这里我们使用nn的ln1，但是是如下实现原理。
+    '''
+    def __init__(self,dim,eps=1e-5):
+        self.gamma = torch.ones(dim)  # (dim,)
+        self.beta = torch.zeros(dim)
+        self.eps = eps
+        
+    def __call__(self,x):
+        # batch mean and variance
+        xmean = x.mean(1,keepdim=True) # (batch,1)
+        xvar = x.var(1,keepdim=True)   # (batch,1)
+
+        xhat = (x-xmean)/torch.sqrt(xvar+self.eps)  # (batch,dim)
+        self.out = self.gamma * xhat + self.beta  # (batch,dim)
+        
+        return self.out
+    
+
 # 定义模型
 class BigramLanguageModel(nn.Module):
     def __init__(self):
@@ -160,6 +186,8 @@ class BigramLanguageModel(nn.Module):
             Block(n_heads=4,n_embed=n_embed),
             Block(n_heads=4,n_embed=n_embed),
             Block(n_heads=4,n_embed=n_embed),
+            # 8. 在经过transformer所有计算之后，在输出logits线性层之前，使用layer norm进行标准化
+            nn.LayerNorm(n_embed),
         )
         # 2.通常模型是主干网络backbone，最后的输出是head，表示预测结果，如二分类、多分类、回归等，也就是最后一层叫head
         self.lm_head = nn.Linear(n_embed,vocab_size) # lm_head是large language model head的缩写

@@ -10,6 +10,9 @@
     "stoi",
     "tril",
     "xbow",
-    "xprev"
+    "xhat",
+    "xmean",
+    "xprev",
+    "xvar"
   ]
 }
