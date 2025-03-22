@@ -68,6 +68,7 @@ def estimate_loss():
   
   
 class Head(nn.Module):
+    '''单头自注意力模块，使用transformer算法将输入的B,T,C在T的维度实现注意力计算后再转换成B,T,head_size的输出'''
     def __init__(self,head_size):
         super().__init__()
         self.key = nn.Linear(n_embed,head_size,bias=False)
@@ -90,17 +91,31 @@ class Head(nn.Module):
         return out
         
 class MultiHeadAttention(nn.Module):
+    '''多头自注意力层，就是将多个头的注意力结果在C的维度cat起来'''
     def __init__(self,n_heads,head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+        
+        # 7. 增加最后一层残差连接的投影projection，因为x相当于原始的logits，而sa当前是使用了relu之后的激活值，
+        #    所以需要一个全连接层再次将值投影到logits的空间。
+        self.proj = nn.Linear(n_embed,n_embed)
     
     def forward(self,x):
-        return torch.cat([h(x) for h in self.heads],dim=-1)
-  
+        out =  torch.cat([h(x) for h in self.heads],dim=-1)
+        out = self.proj(out)
+        return out
 class FeedForward(nn.Module):
-    def __init__(self,hidden_size):
+    '''前馈层，连接在注意力层之后，让token在互相交流之后，能够独立思考的层'''
+    def __init__(self,n_embed):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(hidden_size,hidden_size),nn.ReLU())
+        self.net = nn.Sequential(
+            # 8. 按照原始论文的设计，ffd层内部维数提高4倍再缩放回n_embed
+            nn.Linear(n_embed,4 * n_embed),
+            nn.ReLU(),
+            # 7. 增加最后一层残差连接的投影projection，因为x相当于原始的logits，而sa当前是使用了relu之后的激活值，
+            #    所以需要一个全连接层再次将值投影到logits的空间。
+            nn.Linear(4 * n_embed,n_embed)
+            )
     
     def forward(self,x):
         return self.net(x)  
@@ -114,13 +129,17 @@ class Block(nn.Module):
         #     MultiHeadAttention(n_heads=n_heads,head_size=head_size)
         #     FeedForward(n_embed)
         # )
+        
         self.sa = MultiHeadAttention(n_heads=n_heads,head_size=head_size)
         self.ffwd = FeedForward(n_embed)
     
     def forward(self,x):
         # return self.block(x)
-        x = self.sa(x)
-        x = self.ffwd(x)
+        
+        # 7. x + 是使用了残差连接，sa和ffwd都是属于残差连接旁边的块，刚开始这些块对训练的贡献很小，相当于x=x+0，但是随着训练的进行，
+        #    这些块的输出会逐渐变得更加重要，最终可以帮助模型更好地拟合数据，这就是残差连接的原理。
+        x = x + self.sa(x)
+        x = x + self.ffwd(x)
         return x
     
 # 定义模型
