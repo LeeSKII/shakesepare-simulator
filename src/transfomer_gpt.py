@@ -6,14 +6,27 @@ import torch.nn.functional as F
 import os
 
 # hyper parameters
-batch_size = 32 #有多少个批次的数据同时进行训练，评估损失，更新参数
-block_size = 8
+# batch_size = 32 #有多少个批次的数据同时进行训练，评估损失，更新参数
+# block_size = 8
+# max_iters = 5000
+# eval_interval = 300
+# learning_rate = 1e-3 # le-2 4.使用attention之后适当的降低学习率，因为attention模块无法承受很高的学习率
+# device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# eval_iters = 200
+# n_embed = 32 # 词嵌入的维度
+
+# hyper parameters scaled
+batch_size = 64 #有多少个批次的数据同时进行训练，评估损失，更新参数
+block_size = 256
 max_iters = 5000
-eval_interval = 300
-learning_rate = 1e-3 # le-2 4.使用attention之后适当的降低学习率，因为attention模块无法承受很高的学习率
+eval_interval = 500
+learning_rate = 3e-4 # 扩大规模后进一步降低学习率
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embed = 32 # 词嵌入的维度
+n_embed = 384 # 词嵌入的维度
+n_layer = 8 # 多少个block层
+n_head = 6 # 多少个头 head_size = n_embed // n_heads=64
+dropout = 0.2 # 随机失活的概率 因为网络扩大之后防止过拟合
 #------------------------------------
 print(f"Using device: {device}")
 #------------------------------------
@@ -75,6 +88,9 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embed,head_size,bias=False)
         self.value = nn.Linear(n_embed,head_size,bias=False)
         self.register_buffer('tril',torch.tril(torch.ones(block_size,block_size)))
+        
+        # 9. 在计算token之间的亲密度的时候，增加dropout层，防止过拟合
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self,x):
         B,T,C = x.shape
@@ -85,6 +101,8 @@ class Head(nn.Module):
         # self.tril[:T,:T]对下三角的矩阵进行切片操作，只取:T,:T的部分
         wei = wei.masked_fill(self.tril[:T,:T]==0,float('-inf'))
         wei = F.softmax(wei,dim=-1) # B,T,T
+        # 9. 在计算token之间的亲密度的时候，增加dropout层，随机的阻止一些token进行通信
+        wei = self.dropout(wei)
         
         v = self.value(x)  # B,T,head_size
         out = wei @ v  # B,T,head_size
@@ -114,7 +132,9 @@ class FeedForward(nn.Module):
             nn.ReLU(),
             # 7. 增加最后一层残差连接的投影projection，因为x相当于原始的logits，而sa当前是使用了relu之后的激活值，
             #    所以需要一个全连接层再次将值投影到logits的空间。
-            nn.Linear(4 * n_embed,n_embed)
+            nn.Linear(4 * n_embed,n_embed),
+            # 9. 在返回残差通路之前，增加dropout层，防止过拟合
+            nn.Dropout(dropout)
             )
     
     def forward(self,x):
@@ -169,7 +189,7 @@ class LayerNorm1d:
     
 
 # 定义模型
-class BigramLanguageModel(nn.Module):
+class TransformerLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         # 1. 词嵌入层，将输入的token转换为词向量
@@ -183,9 +203,7 @@ class BigramLanguageModel(nn.Module):
         #self.ffwd = FeedForward(n_embed)
         # 6.将4，5的multi head attention和feed-forward层堆叠起来作为一个block
         self.blocks = nn.Sequential(
-            Block(n_heads=4,n_embed=n_embed),
-            Block(n_heads=4,n_embed=n_embed),
-            Block(n_heads=4,n_embed=n_embed),
+            *[Block(n_heads=n_head,n_embed=n_embed) for _ in range(n_layer)],
             # 8. 在经过transformer所有计算之后，在输出logits线性层之前，使用layer norm进行标准化
             nn.LayerNorm(n_embed),
         )
@@ -242,7 +260,7 @@ class BigramLanguageModel(nn.Module):
         return idx
       
 # 构建模型实例
-m = BigramLanguageModel()
+m = TransformerLanguageModel()
 # 这里将模型参数移动到GPU上，如果cuda是可用的
 model = m.to(device)
 
@@ -265,4 +283,5 @@ for iter in range(max_iters):
 
 # 生成结果
 context = torch.zeros((1,1), dtype=torch.long, device=device) # 将输入数据也放置在device上
-print(decode(model.generate(idx=context,max_new_tokens=500)[0].tolist()))
+model.eval()
+print(decode(model.generate(idx=context,max_new_tokens=1000)[0].tolist()))
