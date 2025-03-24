@@ -8,21 +8,25 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# TODO: dropout,flash attention,init weights.
+# Note
+# 1.残差连接可以显著提升深度网络训练的稳定性，当block的数量从1到3，基本网络开始出现训练不动，loss无法收敛，但是仅在block中的attention模块和ffw模块应用残差连接之后，马上可以按预期训练；
+# 2.dropout应用在attention，ffw的每层输出之后，可以很大程度上解决训练过拟合的问题，论文0.1，本例感觉0.2合适；
+# 3.flash attention 很快，基本加速了一倍
+# 4.较大的学习率会导致过拟合，当dropout和layernorm不能解决过拟合，直接降低学习率
 
 @dataclass
 class GPTConfig:
     '''Config of the nano GPT model'''
-    batch_size = 8 # 迭代一次使用多少批数据
-    block_size = 32 # 上下文长度
+    batch_size = 64 # 迭代一次使用多少批数据
+    block_size = 256 # 上下文长度
     vocab_size = None # 词表大小
-    n_layer = 3 # transformer中block的数量
-    n_head = 8 # transformer中head的数量
-    n_embd = 256 # embedding的维度
-    dropout = 0.1 # dropout的概率
-    max_iters = 5001 # 训练的最大步数
+    n_layer = 8 # transformer中block的数量
+    n_head = 6 # transformer中head的数量
+    n_embd = 384 # embedding的维度
+    dropout = 0.2 # dropout的概率
+    max_iters = 8001 # 训练的最大步数
     eval_interval = 500 # 每隔多少步进行一次验证
-    learning_rate = 3e-4 # 扩大规模后进一步降低学习率
+    learning_rate = 1e-4 # 扩大规模后进一步降低学习率
     device = 'cuda' if torch.cuda.is_available() else 'cpu' # 是否使用GPU
     bias = True # 是否使用bias
 
@@ -94,15 +98,17 @@ class LayerNorm(nn.Module):
 class MLP(nn.Module):
     def __init__(self,config:GPTConfig):
         super().__init__()
-        self.fc1 = nn.Linear(config.n_embd,4*config.n_embd,bias=config.bias)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(4*config.n_embd,config.n_embd,bias=config.bias)
+        self.c_fc = nn.Linear(config.n_embd,4*config.n_embd,bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(4*config.n_embd,config.n_embd,bias=config.bias)
+        self.drop = nn.Dropout(config.dropout)
         
     def forward(self,x):
-        out = self.fc1(x)
-        out = self.act(out)
-        out = self.fc2(out)
-        return out
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.drop(x)
+        return x
         
           
 class CausalSelfAttention(nn.Module):
@@ -119,7 +125,19 @@ class CausalSelfAttention(nn.Module):
         self.q = nn.Linear(config.n_embd,config.n_embd,bias=False)
         self.k = nn.Linear(config.n_embd,config.n_embd,bias=False)
         self.v = nn.Linear(config.n_embd,config.n_embd,bias=False)
-        self.register_buffer('mask_tril',torch.tril(torch.ones(config.block_size,config.block_size)))      
+
+        self.attn_dropout = nn.Dropout(config.dropout)
+
+        # output projection 因为使用了残差连接之后，x与注意力计算之后的数值直接相加，需要一个投影层统一维数和logits化
+        self.c_proj = nn.Linear(config.n_embd,config.n_embd,bias=config.bias)
+        
+        self.res_net_dropout = nn.Dropout(config.dropout)
+
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print('using slow attention')
+            self.register_buffer('mask_tril',torch.tril(torch.ones(config.block_size,config.block_size)))      
         
     def forward(self,x):
         b,t,c = x.shape
@@ -133,15 +151,27 @@ class CausalSelfAttention(nn.Module):
         query = query.view(b,t,self.n_head,single_head_size).transpose(1,2) # b,h,t,c/h
         key = key.view(b,t,self.n_head,single_head_size).transpose(1,2) # b,h,t,c/h
         value = value.view(b,t,self.n_head,single_head_size).transpose(1,2) # b,h,t,c/h
-        
-        wei = query @ key.transpose(-2,-1) * single_head_size ** -0.5 # b,t,c
-        masked_wei = wei.masked_fill(self.mask_tril[:t,:t]==0,float('-inf')) # b,t,c
-        attn = masked_wei.softmax(dim=-1) # b,t,c
-        
-        out = attn @ value # b,t,c        
+
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            out = torch.nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # 常规的attention计算公式           
+            wei = query @ key.transpose(-2,-1) * single_head_size ** -0.5 # b,t,c
+            masked_wei = wei.masked_fill(self.mask_tril[:t,:t]==0,float('-inf')) # b,t,c
+            attn = masked_wei.softmax(dim=-1) # b,t,c
+
+            # 使用dropout随机的阻止某些token的交流，降低过拟合
+            attn = self.attn_dropout(attn)
+            
+            out = attn @ value # b,t,c        
         
         # 将转置后的不连续内存张量连续化再view成原始形状
         out = out.transpose(1,2).contiguous().view(b,t,c) # b,t,c 
+        # output projection 因为使用了残差连接之后，x与注意力计算之后的数值直接相加，需要一个投影层统一维数和logits化
+        out = self.c_proj(out)
+
+        out = self.res_net_dropout(out)
        
         return out
 
@@ -170,7 +200,8 @@ class GPT(nn.Module):
         self.config = config
         self.n_embd = config.n_embd
         self.wte = nn.Embedding(config.vocab_size,config.n_embd) # B,T,C
-        self.wpe = nn.Embedding(config.block_size,config.n_embd)
+        self.wpe = nn.Embedding(config.block_size,config.n_embd) # B,T,C
+        self.dropout = nn.Dropout(config.dropout)
         
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln = nn.LayerNorm(config.n_embd)
@@ -184,6 +215,9 @@ class GPT(nn.Module):
         pos = torch.arange(0,t,device=self.config.device,dtype=torch.long) # t
         position_embed = self.wpe(pos) #t,n_embd
         x = token_embed + position_embed #b,t,n_embd
+
+        # 降低过拟合
+        x = self.dropout(x)
         
         for block in self.blocks:
             x = block(x)
