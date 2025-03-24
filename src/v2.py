@@ -122,9 +122,9 @@ class CausalSelfAttention(nn.Module):
         # k,q,v三个矩阵存储在一起
         # self.c_attn = nn.Linear(config.n_embd,config.n_embd * 3,bias=config.bias)
         
-        self.q = nn.Linear(config.n_embd,config.n_embd,bias=False)
-        self.k = nn.Linear(config.n_embd,config.n_embd,bias=False)
-        self.v = nn.Linear(config.n_embd,config.n_embd,bias=False)
+        self.q = nn.Linear(config.n_embd,config.n_embd,bias=config.bias)
+        self.k = nn.Linear(config.n_embd,config.n_embd,bias=config.bias)
+        self.v = nn.Linear(config.n_embd,config.n_embd,bias=config.bias)
 
         self.attn_dropout = nn.Dropout(config.dropout)
 
