@@ -6,11 +6,11 @@ import math
 
 @dataclass
 class GPTConfig:
-    block_size: int = 256
-    vocab_size: int = 50257
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 384
+    block_size: int = 1024 # max sequence length
+    vocab_size: int = 50257 # 50,000 BPE merges + 256 bytes token + 1 <|endoftext|> special token
+    n_layer: int = 12 # number of transformer blocks
+    n_head: int = 12 # number of attention heads
+    n_embd: int = 768 # embedding dimension
     
 
 class CausalSelfAttention(nn.Module):
@@ -30,7 +30,7 @@ class CausalSelfAttention(nn.Module):
         # 这里相当于用了一个全连接层将x的C维数扩展到了3*C，然后再切分成3个C维度的矩阵分别为q,k,v
         qkv = self.c_attn(x)
         q,k,v = qkv.split(self.n_embd,dim=2)
-        # B batch， T sequence length, nh number of head , hs head size
+        # B: batch， T: sequence length, nh: number of head , hs: head size
         # 拆分为多头注意力
         q = q.view(B,T,self.n_head,C//self.n_head).transpose(1,2) # B,nh,T,hs
         k = k.view(B,T,self.n_head,C//self.n_head).transpose(1,2) # B,nh,T,hs

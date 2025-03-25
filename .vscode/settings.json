@@ -3,6 +3,7 @@
     "allclose",
     "Bigram",
     "embd",
+    "endoftext",
     "ffwd",
     "GELU",
     "itos",
