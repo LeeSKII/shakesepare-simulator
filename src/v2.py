@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
 # Note
 # 1.残差连接可以显著提升深度网络训练的稳定性，当block的数量从1到3，基本网络开始出现训练不动，loss无法收敛，但是仅在block中的attention模块和ffw模块应用残差连接之后，马上可以按预期训练；
 # 2.dropout应用在attention，ffw的每层输出之后，可以很大程度上解决训练过拟合的问题，论文0.1，本例感觉0.2合适；
@@ -83,6 +84,17 @@ def estimate_loss(model,train_data,val_data,config: GPTConfig):
     model.train()
     return out
   
+# according paper 《transformer without layer norm》
+class DynamicTanh(nn.Module):
+    def __init__(self,dim_C,init_alpha=0.5):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(1) * init_alpha)
+        self.gamma = nn.Parameter(torch.ones(dim_C))
+        self.beta = nn.Parameter(torch.zeros(dim_C))
+    
+    def forward(self,x):
+        x = self.gamma * F.tanh(self.alpha * x) + self.beta
+        return x
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -182,13 +194,15 @@ class Block(nn.Module):
         self.config = config
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
-        self.ln1 = nn.LayerNorm(config.n_embd)
-        self.ln2 = nn.LayerNorm(config.n_embd)
+        # self.ln1 = nn.LayerNorm(config.n_embd)
+        # self.ln2 = nn.LayerNorm(config.n_embd)
+        self.dyt1 = DynamicTanh(config.n_embd)
+        self.dyt2 = DynamicTanh(config.n_embd)
         
     def forward(self,x):
         # + 是残差连接操作
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.attn(self.dyt1(x))
+        x = x + self.mlp(self.dyt2(x))
         return x
         
 
@@ -204,7 +218,8 @@ class GPT(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.ln = nn.LayerNorm(config.n_embd)
+        # self.ln = nn.LayerNorm(config.n_embd)
+        self.dyt = DynamicTanh(config.n_embd)
         
         self.lm_head = nn.Linear(config.n_embd,config.vocab_size,bias=config.bias) # B,T,vocab_size
         
@@ -222,7 +237,9 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
         
-        x = self.ln(x)
+        # x = self.ln(x)
+        x = self.dyt(x)
+
         logits = self.lm_head(x)
         
         if target is None:
@@ -260,32 +277,37 @@ if __name__ == '__main__':
     #------------Preparing data------------------------  
     train_data,val_data,encode,decode = prepare_data(config)
    
+    torch.set_float32_matmul_precision('high')
     # 定义模型
     model = GPT(config)
     model = model.to(config.device)
+    # model = torch.compile(model)  # 4090D无法运行
     
     # 定义优化器
     optimizer = torch.optim.AdamW(model.parameters(),lr=config.learning_rate)
-
-    start_time = time.time()
-    # 训练模型
-    for iter in range(config.max_iters):
-        
-        if iter % config.eval_interval == 0:
-            immediate_time = time.time()
+    try:
+        start_time = time.time()
+        # 训练模型
+        for iter in range(config.max_iters):
             
-            losses = estimate_loss(model,train_data,val_data,config)
-            print(f"Iter {iter}, Train Loss: {losses['train']:.4f}, Test Loss: {losses['test']:.4f},Time consume: {immediate_time-start_time}")
-            start_time = immediate_time
+            if iter % config.eval_interval == 0:
+                immediate_time = time.time()
+                
+                losses = estimate_loss(model,train_data,val_data,config)
+                print(f"Iter {iter}, Train Loss: {losses['train']:.4f}, Test Loss: {losses['test']:.4f},Time consume: {immediate_time-start_time}")
+                start_time = immediate_time
+            
+            xb,yb = get_batch(split='train',train_data=train_data,val_data=val_data,batch_size=config.batch_size,block_size=config.block_size,device=config.device)
         
-        xb,yb = get_batch(split='train',train_data=train_data,val_data=val_data,batch_size=config.batch_size,block_size=config.block_size,device=config.device)
-      
-        logits,loss = model(xb,yb)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-        
+            logits,loss = model(xb,yb)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            # torch.cuda.synchronize()  # 确保所有 CUDA 操作完成
+    except Exception as e:
+        print(f"发生了训练期间未知错误:\n {e}")
     # 生成结果
     context = torch.zeros((1,1), dtype=torch.long, device=config.device) # 将输入数据也放置在device上
     model.eval()
-    print(decode(model.generate(idx=context,max_new_tokens=1000,config=config)[0].tolist()))
+    print(decode(model.generate(idx=context,max_new_tokens=5000,config=config)[0].tolist()))
